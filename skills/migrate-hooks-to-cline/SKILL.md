@@ -1,5 +1,5 @@
 ---
-name: migratie-hooks-to-cline
+name: migrate-hooks-to-cline
 description: Migrate Claude Code JSON-configured hooks into `.clinerules/hooks/` through an agent-led, script-backed workflow. The agent handles semantic migration and writes handler `.mjs`; thin scripts handle scanning, entry-script generation, verification, and cleanup. Do not handle skills, commands, agents, rules, or workflows.
 ---
 
