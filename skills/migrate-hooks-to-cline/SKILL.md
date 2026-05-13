@@ -1,5 +1,5 @@
 ---
-name: migrate-hooks-to-cline
+name: migratie-hooks-to-cline
 description: Migrate Claude Code JSON-configured hooks into `.clinerules/hooks/` through an agent-led, script-backed workflow. The agent handles semantic migration and writes handler `.mjs`; thin scripts handle scanning, entry-script generation, verification, and cleanup. Do not handle skills, commands, agents, rules, or workflows.
 ---
 
@@ -13,6 +13,7 @@ Only migrate Claude Code JSON-configured hooks from:
 - `.claude/settings.local.json`
 
 Do not scan or migrate skills, commands, agents, rules, or workflows.
+Never emit install or migration steps that copy `skills/`, `.agents/skills/`, or `.claude/skills/` into `.cline/skills/`.
 
 ## Architecture
 
@@ -58,6 +59,18 @@ All scripts live under `scripts/`:
 | `verify-hooks.mjs` | Checks file existence, runs `node --check`, runs smoke tests |
 | `utils.mjs` | Shared helpers for paths, events, naming, logging |
 
+## Script Location Rule
+
+Treat `scripts/` as relative to the directory containing this `SKILL.md`, not relative to the current working directory.
+
+- If this skill was installed by the CLI into a target project, the usual script path is:
+
+  ```bash
+  node .agents/skills/migrate-hooks-to-cline/scripts/run-migration.mjs prepare
+  ```
+
+Never copy `run-migration.mjs` into another directory and run it detached from its sibling files. `scan-hooks.mjs`, `verify-hooks.mjs`, and `utils.mjs` must remain in the same skill-local `scripts/` directory.
+
 ### `run-migration.mjs`
 
 - **Subcommands**: `prepare`, `finalize`
@@ -89,14 +102,16 @@ All scripts live under `scripts/`:
 2. **Prepare** — Run the prepare command:
 
    ```bash
-   node scripts/run-migration.mjs prepare
+   node <current-skill-dir>/scripts/run-migration.mjs prepare
    ```
 
    If a repo source was provided:
 
    ```bash
-   node scripts/run-migration.mjs prepare --repo <user>/<repo>
+   node <current-skill-dir>/scripts/run-migration.mjs prepare --repo <user>/<repo>
    ```
+
+   `<current-skill-dir>` means the directory containing this `SKILL.md`, for example `.agents/skills/migrate-hooks-to-cline` or `.claude/skills/agents-hub-setup-guide-migration`.
 
    - **Script entry**: `run-migration.mjs`
    - **Subcommand**: `prepare`
@@ -119,7 +134,7 @@ All scripts live under `scripts/`:
 6. **Finalize** — Hand results back to the script layer:
 
    ```bash
-   node scripts/run-migration.mjs finalize --project-root . --cleanup-path .tmp/<repo-name>
+   node <current-skill-dir>/scripts/run-migration.mjs finalize --project-root . --cleanup-path .tmp/<repo-name>
    ```
 
    `finalize` reads the agent result from **stdin** (e.g. `expectedFiles`, `unresolvedHooks`).
