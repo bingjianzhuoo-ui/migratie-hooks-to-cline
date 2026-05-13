@@ -4,6 +4,7 @@
 
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { scanHooks } from './scan-hooks.mjs';
 import { verifyHooks } from './verify-hooks.mjs';
 import {
@@ -139,6 +140,18 @@ export async function buildAgentContext({
   scanResult,
 }) {
   const { hooks, sourceFiles } = await collectHookSources(sourceRoot, scanResult);
+  const prepareCommandExample = buildRunMigrationCommand(projectRoot, [
+    'prepare',
+    '--repo',
+    'obra/superpowers',
+  ]);
+  const finalizeCommandExample = buildRunMigrationCommand(projectRoot, [
+    'finalize',
+    '--project-root',
+    '.',
+    '--cleanup-path',
+    '.tmp/superpowers',
+  ]);
 
   return {
     generatedAt: new Date().toISOString(),
@@ -163,11 +176,18 @@ export async function buildAgentContext({
         'Only write migrated handler .mjs files. Do not write Unix/Windows entry scripts; the script layer generates those after handler translation.',
       failureRule:
         'If any hook cannot be safely migrated, fail explicitly instead of writing placeholder files.',
-      prepareCommandExample: 'node scripts/run-migration.mjs prepare --repo obra/superpowers',
-      finalizeCommandExample:
-        'node scripts/run-migration.mjs finalize --project-root . --cleanup-path .tmp/superpowers',
+      prepareCommandExample,
+      finalizeCommandExample,
     },
   };
+}
+
+export function buildRunMigrationCommand(projectRoot, args = []) {
+  const relativeScriptPath = path
+    .relative(resolveRepoRoot(projectRoot), fileURLToPath(import.meta.url))
+    .replaceAll(path.sep, '/');
+
+  return ['node', relativeScriptPath, ...args].join(' ');
 }
 
 export function resolveExecutionContext({
