@@ -2,11 +2,11 @@
 /* global process */
 // @ts-check
 
-import { chmod, mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { execFile, spawn } from 'node:child_process';
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
+import path from 'node:path';
+import { promisify } from 'node:util';
 import {
   isDirectRun,
   logError,
@@ -15,6 +15,8 @@ import {
   resolveHooksOutputDir,
   resolveRepoRoot,
 } from './utils.mjs';
+
+const DEFAULT_ENTRY_EXECUTION_TIMEOUT_MS = 15_000;
 
 async function pathStats(targetPath) {
   try {
@@ -104,30 +106,19 @@ function shellEscape(value) {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
-async function runUnixScript(scriptPath, stdinInput) {
-  const captureDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-capture-'));
-  const stdoutPath = path.join(captureDir, 'stdout.txt');
-  const stderrPath = path.join(captureDir, 'stderr.txt');
-
+async function runBashCommand(command, cwd, timeoutMs) {
   try {
-    await execFileAsync(
-      'bash',
-      [
-        '-lc',
-        `printf '%s' ${shellEscape(stdinInput)} | /bin/sh ${shellEscape(scriptPath)} > ${shellEscape(stdoutPath)} 2> ${shellEscape(stderrPath)}`,
-      ],
-      { cwd: path.dirname(scriptPath) },
-    );
-
+    await execFileAsync('bash', ['-lc', command], {
+      cwd,
+      timeout: timeoutMs,
+      killSignal: 'SIGTERM',
+    });
     return {
-      stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
-      stderr: await readFile(stderrPath, 'utf8').catch(() => ''),
       exitCode: 0,
+      timedOut: false,
     };
   } catch (error) {
     return {
-      stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
-      stderr: await readFile(stderrPath, 'utf8').catch(() => ''),
       exitCode:
         error != null
         && typeof error === 'object'
@@ -135,94 +126,491 @@ async function runUnixScript(scriptPath, stdinInput) {
         && typeof error.code === 'number'
           ? error.code
           : 1,
+      timedOut:
+        Boolean(
+          error != null
+          && typeof error === 'object'
+          && 'killed' in error
+          && error.killed,
+        ),
     };
-  } finally {
-    await rm(captureDir, { recursive: true, force: true });
   }
 }
 
-async function runInlineNodeScript(scriptSource, stdinInput, cwd = process.cwd()) {
-  const captureDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-node-'));
+async function readCapturedExecution(captureDir, { exitCode, timedOut, timeoutMs }) {
+  const stdoutPath = path.join(captureDir, 'stdout.txt');
+  const stderrPath = path.join(captureDir, 'stderr.txt');
+  const timeoutMessage = `[verify-hooks] execution timed out after ${timeoutMs}ms`;
+  const capturedStderr = await readFile(stderrPath, 'utf8').catch(() => '');
+
+  return {
+    stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
+    stderr:
+      timedOut
+        ? capturedStderr.trim().length > 0
+          ? `${capturedStderr}\n${timeoutMessage}`
+          : timeoutMessage
+        : capturedStderr,
+    exitCode,
+  };
+}
+
+async function runCommandWithClosedStdin(command, args, stdinInput, cwd, timeoutMs) {
+  return await new Promise((resolve) => {
+    const child = spawn(command, args, {
+      cwd,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    let stdout = '';
+    let stderr = '';
+    let settled = false;
+    let timedOut = false;
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString('utf8');
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString('utf8');
+    });
+
+    child.on('error', (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutHandle);
+      resolve({
+        stdout,
+        stderr: stderr || (error instanceof Error ? error.message : String(error)),
+        exitCode: 1,
+        timedOut,
+      });
+    });
+
+    child.on('close', (code) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutHandle);
+      resolve({
+        stdout,
+        stderr,
+        exitCode: typeof code === 'number' ? code : 1,
+        timedOut,
+      });
+    });
+
+    const timeoutHandle = setTimeout(() => {
+      if (settled) {
+        return;
+      }
+      timedOut = true;
+      child.kill('SIGTERM');
+    }, timeoutMs);
+
+    child.stdin.end(stdinInput);
+  });
+}
+
+async function runUnixScript(scriptPath, stdinInput, timeoutMs) {
+  const captureDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-shell-'));
+  const stdinPath = path.join(captureDir, 'stdin.json');
   const stdoutPath = path.join(captureDir, 'stdout.txt');
   const stderrPath = path.join(captureDir, 'stderr.txt');
 
-  try {
-    await execFileAsync(
-      'bash',
-      [
-        '-lc',
-        `printf '%s' ${shellEscape(stdinInput)} | node -e ${shellEscape(scriptSource)} > ${shellEscape(stdoutPath)} 2> ${shellEscape(stderrPath)}`,
-      ],
-      { cwd },
-    );
+  await writeFile(stdinPath, stdinInput, 'utf8');
 
-    return {
-      stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
-      stderr: await readFile(stderrPath, 'utf8').catch(() => ''),
-      exitCode: 0,
-    };
-  } catch (error) {
-    return {
-      stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
-      stderr: await readFile(stderrPath, 'utf8').catch(() => ''),
-      exitCode:
-        error != null
-        && typeof error === 'object'
-        && 'code' in error
-        && typeof error.code === 'number'
-          ? error.code
-          : 1,
-    };
+  try {
+    const result = await runBashCommand(
+      `cat ${shellEscape(stdinPath)} | /bin/sh ${shellEscape(scriptPath)} > ${shellEscape(stdoutPath)} 2> ${shellEscape(stderrPath)}`,
+      path.dirname(scriptPath),
+      timeoutMs,
+    );
+    return await readCapturedExecution(captureDir, {
+      ...result,
+      timeoutMs,
+    });
   } finally {
     await rm(captureDir, { recursive: true, force: true });
   }
 }
 
-async function smokeTestUnixEntry(eventName, entryScriptContent, repoRoot) {
-  const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-'));
-  const entryPath = path.join(tmpDir, eventName);
-  const handler1 = path.join(tmpDir, `${eventName}-plugin1.mjs`);
-  const handler2 = path.join(tmpDir, `${eventName}-plugin2.mjs`);
+async function detectPowerShellCommand() {
+  const candidates = process.platform === 'win32'
+    ? ['pwsh', 'powershell']
+    : ['pwsh'];
 
-  try {
-    await writeFile(
-      handler1,
-      `console.log('plugin1-context');\nprocess.exit(0);\n`,
-      'utf8',
-    );
-    await writeFile(handler2, `process.exit(0);\n`, 'utf8');
-    await writeFile(entryPath, entryScriptContent, 'utf8');
-    await chmod(entryPath, 0o755);
-
-    const { stdout, stderr, exitCode } = await runUnixScript(
-      entryPath,
-      JSON.stringify({ toolName: 'Read', toolInput: {} }),
-    );
-
-    if (exitCode !== 0) {
-      throw new Error(
-        `Entry script smoke test exited with code ${exitCode}: ${stderr || stdout}`,
-      );
-    }
-
-    let output;
+  for (const candidate of candidates) {
     try {
-      output = JSON.parse(stdout.trim());
+      await execFileAsync(candidate, ['-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()']);
+      return candidate;
     } catch {
-      throw new Error(`Unexpected smoke test output: ${stdout}`);
+      // Try the next runtime.
     }
-
-    if (
-      output.cancel !== false ||
-      output.contextModification !== 'plugin1-context'
-    ) {
-      throw new Error(
-        `Unexpected smoke test output: ${stdout}`,
-      );
-    }
-  } finally {
-    await rm(tmpDir, { recursive: true, force: true });
   }
+
+  return null;
+}
+
+async function runWindowsScript(scriptPath, stdinInput, command, timeoutMs) {
+  if (process.platform !== 'win32') {
+    const captureDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-ps1-'));
+    const stdinPath = path.join(captureDir, 'stdin.json');
+    const stdoutPath = path.join(captureDir, 'stdout.txt');
+    const stderrPath = path.join(captureDir, 'stderr.txt');
+
+    await writeFile(stdinPath, stdinInput, 'utf8');
+
+    try {
+      const result = await runBashCommand(
+        `cat ${shellEscape(stdinPath)} | ${shellEscape(command)} -NoProfile -File ${shellEscape(scriptPath)} > ${shellEscape(stdoutPath)} 2> ${shellEscape(stderrPath)}`,
+        path.dirname(scriptPath),
+        timeoutMs,
+      );
+      return await readCapturedExecution(captureDir, {
+        ...result,
+        timeoutMs,
+      });
+    } finally {
+      await rm(captureDir, { recursive: true, force: true });
+    }
+  }
+
+  return await runCommandWithClosedStdin(
+    command,
+    ['-NoProfile', '-File', scriptPath],
+    stdinInput,
+    path.dirname(scriptPath),
+    timeoutMs,
+  );
+}
+
+function buildEntryFixture(eventName, repoRoot) {
+  const baseFixture = {
+    eventName,
+    workspaceRoot: repoRoot,
+    cwd: repoRoot,
+    task: 'verify migrated hook execution',
+    message: 'verify migrated hook execution',
+    userPrompt: 'verify migrated hook execution',
+    toolName: 'Read',
+    tool_name: 'Read',
+    toolInput: {
+      filePath: 'README.md',
+      path: 'README.md',
+    },
+    parameters: {
+      filePath: 'README.md',
+      path: 'README.md',
+    },
+    result: 'ok',
+    success: true,
+    executionTimeMs: 1,
+    transcriptPath: 'transcript.md',
+  };
+
+  const fixtureByEvent = {
+    PreToolUse: {
+      ...baseFixture,
+      preToolUse: {
+        toolName: 'Read',
+        parameters: baseFixture.parameters,
+      },
+    },
+    PostToolUse: {
+      ...baseFixture,
+      postToolUse: {
+        toolName: 'Read',
+        parameters: baseFixture.parameters,
+        result: baseFixture.result,
+        success: true,
+        executionTimeMs: 1,
+      },
+    },
+    UserPromptSubmit: {
+      ...baseFixture,
+      prompt: 'verify migrated hook execution',
+      userPromptSubmit: {
+        prompt: 'verify migrated hook execution',
+      },
+    },
+    PreCompact: {
+      ...baseFixture,
+      preCompact: {
+        transcriptPath: 'transcript.md',
+      },
+    },
+    TaskStart: {
+      ...baseFixture,
+      taskStart: {
+        task: 'verify migrated hook execution',
+      },
+    },
+    TaskComplete: {
+      ...baseFixture,
+      taskComplete: {
+        result: 'completed',
+        success: true,
+      },
+    },
+    TaskCancel: {
+      ...baseFixture,
+      success: false,
+      taskCancel: {
+        reason: 'verification fixture cancellation',
+      },
+    },
+  };
+
+  return JSON.stringify(fixtureByEvent[eventName] ?? baseFixture);
+}
+
+function formatCapturedOutput(value) {
+  return value.trim().length > 0 ? value : '(empty)';
+}
+
+function formatExecutionFailure({
+  eventName,
+  runtime,
+  entryPath,
+  repoRoot,
+  exitCode,
+  stdout,
+  stderr,
+  validationError = null,
+}) {
+  const detailLines = [
+    `[verify-hooks] event=${eventName} runtime=${runtime} entry=${path.relative(repoRoot, entryPath)}`,
+    `exitCode=${exitCode}`,
+  ];
+
+  if (validationError) {
+    detailLines.push(`validationError=${validationError}`);
+  }
+
+  detailLines.push(
+    '',
+    'stdout:',
+    formatCapturedOutput(stdout),
+    '',
+    'stderr:',
+    formatCapturedOutput(stderr),
+  );
+
+  return detailLines.join('\n');
+}
+
+function validateEntryOutput({
+  stdout,
+  stderr,
+  exitCode,
+  eventName,
+  runtime,
+  entryPath,
+  repoRoot,
+}) {
+  const trimmedStdout = stdout.trim();
+  if (!trimmedStdout) {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: 'entry did not emit JSON to stdout',
+      }),
+    );
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(trimmedStdout);
+  } catch (error) {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: error instanceof Error ? error.message : String(error),
+      }),
+    );
+  }
+
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: 'entry stdout must be a JSON object',
+      }),
+    );
+  }
+
+  if (typeof parsed.cancel !== 'boolean') {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: 'entry JSON must include boolean cancel',
+      }),
+    );
+  }
+
+  if ('contextModification' in parsed && typeof parsed.contextModification !== 'string') {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: 'contextModification must be a string when provided',
+      }),
+    );
+  }
+
+  if ('errorMessage' in parsed && typeof parsed.errorMessage !== 'string') {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: 'errorMessage must be a string when provided',
+      }),
+    );
+  }
+
+  if (
+    parsed.cancel === false
+    && !('contextModification' in parsed)
+  ) {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+        validationError: 'entry returned cancel:false without contextModification; migrated handlers produced no output',
+      }),
+    );
+  }
+
+  return parsed;
+}
+
+async function executeEntryScript({
+  repoRoot,
+  entryPath,
+  runtime,
+  stdinInput,
+  powerShellCommand = null,
+  executionTimeoutMs = DEFAULT_ENTRY_EXECUTION_TIMEOUT_MS,
+}) {
+  if (runtime === 'shell') {
+    return await runUnixScript(entryPath, stdinInput, executionTimeoutMs);
+  }
+
+  if (!powerShellCommand) {
+    throw new Error(`PowerShell runtime is unavailable for ${path.relative(repoRoot, entryPath)}`);
+  }
+
+  return await runWindowsScript(entryPath, stdinInput, powerShellCommand, executionTimeoutMs);
+}
+
+async function verifyEntryExecution({
+  repoRoot,
+  entryPath,
+  eventName,
+  runtime,
+  executeEntry,
+  powerShellCommand = null,
+  executionTimeoutMs,
+}) {
+  const stdinInput = buildEntryFixture(eventName, repoRoot);
+  const execution = await executeEntry({
+    repoRoot,
+    entryPath,
+    runtime,
+    stdinInput,
+    powerShellCommand,
+    executionTimeoutMs,
+  });
+
+  if (!execution || typeof execution !== 'object') {
+    throw new Error(`Entry executor returned an invalid result for ${path.relative(repoRoot, entryPath)}`);
+  }
+
+  const stdout = typeof execution.stdout === 'string' ? execution.stdout : '';
+  const timedOut = Boolean(
+    execution != null
+    && typeof execution === 'object'
+    && 'timedOut' in execution
+    && execution.timedOut,
+  );
+  const stderrBase = typeof execution.stderr === 'string' ? execution.stderr : '';
+  const stderr = timedOut
+    ? stderrBase.trim().length > 0
+      ? `${stderrBase}\n[verify-hooks] execution timed out after ${executionTimeoutMs}ms`
+      : `[verify-hooks] execution timed out after ${executionTimeoutMs}ms`
+    : stderrBase;
+  const exitCode = typeof execution.exitCode === 'number' ? execution.exitCode : 1;
+
+  if (exitCode !== 0) {
+    throw new Error(
+      formatExecutionFailure({
+        eventName,
+        runtime,
+        entryPath,
+        repoRoot,
+        exitCode,
+        stdout,
+        stderr,
+      }),
+    );
+  }
+
+  validateEntryOutput({
+    stdout,
+    stderr,
+    exitCode,
+    eventName,
+    runtime,
+    entryPath,
+    repoRoot,
+  });
+
+  return {
+    runtime,
+    entryScript: path.relative(repoRoot, entryPath).replaceAll(path.sep, '/'),
+  };
 }
 
 async function verifyWindowsEntryScript(entryPath, repoRoot) {
@@ -277,7 +665,8 @@ export async function verifyHooks({
   repoRoot = process.cwd(),
   expectedFiles = [],
   unresolvedHooks = [],
-  smokeTestEntry = smokeTestUnixEntry,
+  executeEntry = executeEntryScript,
+  executionTimeoutMs = DEFAULT_ENTRY_EXECUTION_TIMEOUT_MS,
 } = {}) {
   const resolvedRepoRoot = resolveRepoRoot(repoRoot);
   const hooksDir = resolveHooksOutputDir(resolvedRepoRoot);
@@ -288,8 +677,14 @@ export async function verifyHooks({
   if (!Array.isArray(unresolvedHooks)) {
     throw new Error('unresolvedHooks must be an array when provided.');
   }
-  if (typeof smokeTestEntry !== 'function') {
-    throw new Error('smokeTestEntry must be a function when provided.');
+  if (typeof executeEntry !== 'function') {
+    throw new Error('executeEntry must be a function when provided.');
+  }
+  if (
+    !Number.isFinite(executionTimeoutMs)
+    || executionTimeoutMs <= 0
+  ) {
+    throw new Error('executionTimeoutMs must be a positive number when provided.');
   }
 
   if (unresolvedHooks.length > 0) {
@@ -328,22 +723,12 @@ export async function verifyHooks({
     await runNodeCheck(filePath, resolvedRepoRoot);
   }
 
-  // Find Unix entry scripts: files without an extension
   const unixEntries = [];
   for (const entry of hookEntries) {
     if (!entry.isFile() || entry.name.startsWith('.') || entry.name.includes('.')) {
       continue;
     }
     unixEntries.push(path.join(hooksDir, entry.name));
-  }
-
-  const smokeTests = [];
-  if (unixEntries.length > 0) {
-    const firstEntry = unixEntries[0];
-    const entryContent = await readFile(firstEntry, 'utf8');
-    const eventName = path.basename(firstEntry);
-    await smokeTestEntry(eventName, entryContent, resolvedRepoRoot);
-    smokeTests.push(path.relative(resolvedRepoRoot, firstEntry));
   }
 
   const windowsEntries = [];
@@ -356,12 +741,76 @@ export async function verifyHooks({
     windowsEntries.push(path.relative(resolvedRepoRoot, entryPath));
   }
 
+  const powerShellCommand = await detectPowerShellCommand();
+  /** @type {Array<{ runtime: string; entryScript: string }>} */
+  const executedEntries = [];
+  /** @type {Array<{ runtime: string; entryScript: string }>} */
+  const supplementalWindowsExecutions = [];
+
+  if (process.platform === 'win32') {
+    if (windowsEntries.length === 0) {
+      throw new Error(`No Windows hook entry scripts found under ${hooksDir}`);
+    }
+
+    for (const entryPath of hookEntries
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.ps1'))
+      .map((entry) => path.join(hooksDir, entry.name))) {
+      executedEntries.push(
+        await verifyEntryExecution({
+          repoRoot: resolvedRepoRoot,
+          entryPath,
+          eventName: path.basename(entryPath, '.ps1'),
+          runtime: 'ps1',
+          executeEntry,
+          powerShellCommand,
+          executionTimeoutMs,
+        }),
+      );
+    }
+  } else {
+    if (unixEntries.length === 0) {
+      throw new Error(`No Unix hook entry scripts found under ${hooksDir}`);
+    }
+
+    for (const entryPath of unixEntries) {
+      executedEntries.push(
+        await verifyEntryExecution({
+          repoRoot: resolvedRepoRoot,
+          entryPath,
+          eventName: path.basename(entryPath),
+          runtime: 'shell',
+          executeEntry,
+          executionTimeoutMs,
+        }),
+      );
+    }
+
+    if (powerShellCommand) {
+      for (const entryPath of hookEntries
+        .filter((entry) => entry.isFile() && entry.name.endsWith('.ps1'))
+        .map((entry) => path.join(hooksDir, entry.name))) {
+        supplementalWindowsExecutions.push(
+          await verifyEntryExecution({
+            repoRoot: resolvedRepoRoot,
+            entryPath,
+            eventName: path.basename(entryPath, '.ps1'),
+            runtime: 'ps1',
+            executeEntry,
+            powerShellCommand,
+            executionTimeoutMs,
+          }),
+        );
+      }
+    }
+  }
+
   return {
     status: 'verified',
     repoRoot: resolvedRepoRoot,
     hooksDir,
     checkedFiles: mjsFiles.map((filePath) => path.relative(resolvedRepoRoot, filePath)),
-    smokeTests,
+    executedEntries,
+    supplementalWindowsExecutions,
     windowsEntries,
   };
 }
