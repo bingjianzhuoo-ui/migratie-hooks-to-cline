@@ -204,7 +204,7 @@ Do not push this logic to an upstream orchestration prompt.
 Success criteria:
 1. `.clinerules/hooks/` contains the expected files.
 2. All `.mjs` files pass `node --check`.
-3. Entry scripts can sequentially invoke handlers and emit valid Cline JSON.
+3. `verify-hooks.mjs` has actually executed the generated entry scripts against the real migrated handlers and received valid Cline JSON.
 4. Unresolved hooks fail explicitly.
 
 ## Script Inventory
@@ -215,7 +215,7 @@ All scripts live under `scripts/`:
 |------|------|
 | `run-migration.mjs` | Main entrypoint; exposes `prepare` and `finalize` subcommands |
 | `scan-hooks.mjs` | Scans hook configs; returns hook facts only |
-| `verify-hooks.mjs` | Checks file existence, runs `node --check`, runs smoke tests |
+| `verify-hooks.mjs` | Checks file existence, runs `node --check`, executes real entry scripts, and surfaces runtime stderr/stdout on failure |
 | `utils.mjs` | Shared helpers for paths, events, naming, logging |
 
 ## Script Location Rule
@@ -248,7 +248,9 @@ Never copy `run-migration.mjs` into another directory and run it detached from i
 
 - Checks that expected output files exist
 - Runs `node --check` on every `.mjs`
-- Runs a minimal smoke test (sequential handler invocation)
+- Executes the generated shell / ps1 entry scripts against the real migrated handlers
+- Feeds each event a minimal stdin fixture and requires valid Cline JSON on stdout
+- On failure, prints the real `eventName`, `entryScript`, `exitCode`, `stdout`, and `stderr`
 - Fails the entire migration if unresolved hooks remain
 
 ### `utils.mjs`
@@ -322,6 +324,11 @@ Never copy `run-migration.mjs` into another directory and run it detached from i
      - Call `generateEntryScriptsForHandlers()`
      - Call `verifyHooks()`
      - Call `cleanupMigrationSource()` **only after verify passes**
+   - `verify` failure is not a soft warning. It means migration is still incomplete.
+   - After a `verify` failure, read the real stderr/stdout from the script output and repair only the generated `.mjs` handler files.
+   - Do not edit the fixed shell / ps1 entry templates to hide handler problems.
+   - After each handler fix, rerun `finalize`.
+   - Retry at most 3 times. If verification still fails, mark the hook set `unresolved` instead of claiming success.
 
 8. **Completion** — Skill is only done after script finalize finishes.
 
@@ -330,7 +337,7 @@ Never skip `finalizeMigration()` and manually invoke `verify-hooks.mjs`.
 ## Agent Write Boundary
 
 - **Allowed**: `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`
-- **Forbidden**: entry scripts, `.tmp` cleanup, and treating unresolved hooks as successful
+- **Forbidden**: entry scripts, `.tmp` cleanup, treating unresolved hooks as successful, and patching fixed entry templates to mask handler failures
 
 ## Script Responsibilities
 
@@ -355,8 +362,9 @@ Script handles only deterministic work:
 
 Skill is complete only when all of the following are true:
 - Agent has written the handler `.mjs` files.
-- Script-generated entry files exist, verification has passed, and cleanup happened only after verification.
+- Script-generated entry files exist, real entry execution verification has passed, and cleanup happened only after verification.
 - Any source context injection has been preserved through handler `stdout` and final entry-script `contextModification`.
+- No outstanding verify failure remains unresolved.
 
 ## Event Mapping
 
