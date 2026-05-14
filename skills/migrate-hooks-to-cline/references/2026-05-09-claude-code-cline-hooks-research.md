@@ -108,6 +108,9 @@ Cline 仅支持 **可执行脚本**（等价于 Claude Code 的 `command` 类型
 
 ### 2.5 关键行为特性
 
+以下内容描述的是 Cline hook 平台原生能力与研究观察，不等于本 skill 当前采用的迁移 contract。
+本 skill 当前约定为：translated handler 只输出最终用户可见文本到 `stdout`，再由 event entry script 统一包装成最终 Cline JSON。
+
 - **跨平台**：同时支持 Unix（无扩展名的 bash 脚本）和 Windows（`.ps1` PowerShell 脚本）。
 - **执行顺序**：Global hooks 先执行，然后 Workspace hooks。任一返回 `cancel: true` 即停止操作。
 - **超时**：30 秒超时，超时后终止 hook 进程并继续。
@@ -139,7 +142,7 @@ Hook 接收的 JSON 字段按类型命名：
 | **平台支持** | 宿主依赖（Unix bash / Windows cmd） | 原生跨平台（`.sh` + `.ps1`） | 每 hook 需生成两套 wrapper |
 | **异步执行** | 支持 `{"async": true}` | 未明确支持 | 无法直接保留异步语义 |
 | **Agent-Scoped** | 支持（frontmatter） | 未明确支持 | 无法直接迁移 agent 级 hooks |
-| **决策控制** | `allow`/`deny`/`ask`/`defer` + `updatedInput` | `cancel: true` + `contextModification` | 决策语义不兼容，只能做最小化桥接 |
+| **决策控制** | `allow`/`deny`/`ask`/`defer` + `updatedInput` | 平台层可表达 `cancel: true` + `contextModification`，但本 skill 默认不要求 handler 直接输出该 JSON | 决策语义不兼容，只能做最小化桥接 |
 
 ### Event 映射关系（精确匹配）
 
