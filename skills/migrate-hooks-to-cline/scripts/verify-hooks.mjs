@@ -187,7 +187,7 @@ async function smokeTestUnixEntry(eventName, entryScriptContent, repoRoot) {
   try {
     await writeFile(
       handler1,
-      `console.log(JSON.stringify({ cancel: false, contextModification: 'plugin1-context' }));\nprocess.exit(0);\n`,
+      `console.log('plugin1-context');\nprocess.exit(0);\n`,
       'utf8',
     );
     await writeFile(handler2, `process.exit(0);\n`, 'utf8');
@@ -227,27 +227,26 @@ async function smokeTestUnixEntry(eventName, entryScriptContent, repoRoot) {
 
 async function verifyWindowsEntryScript(entryPath, repoRoot) {
   const entryScriptContent = await readFile(entryPath, 'utf8');
-  if (!entryScriptContent.includes('function Normalize-HandlerOutput')) {
+  if (!entryScriptContent.includes('function Write-ClineResult')) {
     throw new Error(
-      `Windows entry script is missing the PowerShell normalize function: ${path.relative(repoRoot, entryPath)}`,
+      `Windows entry script is missing JSON result emitter: ${path.relative(repoRoot, entryPath)}`,
     );
   }
-  if (!entryScriptContent.includes('ConvertFrom-Json')) {
+  if (!entryScriptContent.includes('ConvertTo-Json -Compress')) {
     throw new Error(
-      `Windows entry script is missing JSON parsing logic: ${path.relative(repoRoot, entryPath)}`,
-    );
-  }
-  if (!entryScriptContent.includes('Normalize-HandlerOutput -RawOutput $rawOutput')) {
-    throw new Error(
-      `Windows entry script is missing normalize invocation: ${path.relative(repoRoot, entryPath)}`,
+      `Windows entry script is missing JSON serialization: ${path.relative(repoRoot, entryPath)}`,
     );
   }
   if (
     entryScriptContent.includes('$normalizeHandlerOutputBase64')
     || entryScriptContent.includes('Buffer.from(process.argv[1], "base64").toString("utf8")')
+    || entryScriptContent.includes('node -e "console.log(JSON.stringify({cancel:true,errorMessage:process.argv[1]}))"')
+    || entryScriptContent.includes('node -e "console.log(JSON.stringify({cancel:false,contextModification:process.argv[1]}))"')
+    || entryScriptContent.includes('Normalize-HandlerOutput')
+    || entryScriptContent.includes('ConvertFrom-Json')
   ) {
     throw new Error(
-      `Windows entry script still relies on inline node bridge quoting: ${path.relative(repoRoot, entryPath)}`,
+      `Windows entry script still relies on legacy handler normalization: ${path.relative(repoRoot, entryPath)}`,
     );
   }
 }
