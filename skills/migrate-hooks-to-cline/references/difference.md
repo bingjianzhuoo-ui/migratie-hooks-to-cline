@@ -10,7 +10,7 @@ This reference covers hook migration only. Other resource types are handled by `
 | Invocation | Config specifies matcher + handler type + command | Script filename must match event name; Cline passes event JSON via stdin | Wrapper script name = event key; wrapper reads stdin and calls original command |
 | Handler types | `command`, `http`, `mcp_tool`, `prompt`, `agent` | Executable scripts only (`command` equivalent) | Only `command` handlers with local scripts can be wrapped; all others are not migrated |
 | Environment | `CLAUDE_PLUGIN_ROOT` set by Claude Code runtime | Not set automatically | Wrapper must set `CLAUDE_PLUGIN_ROOT` to plugin root |
-| Stdin/stdout | Command receives Claude-style JSON and may signal decisions through Claude-style output / exit status | Script receives Cline event JSON on stdin; must output Cline response JSON on stdout | Wrapper must adapt Cline JSON to Claude-style JSON, invoke the original command, then convert the result back to Cline JSON |
+| Stdin/stdout | Command receives Claude-style JSON and may signal decisions through Claude-style output / exit status | Script receives Cline event JSON on stdin; event entry emits final Cline response JSON | Handler should print final user-visible text to stdout, while the event entry script treats that stdout as literal text and wraps it into final Cline JSON |
 | Platform support | Host-dependent (bash on Unix, cmd on Windows) | Cross-platform via `.sh` (Unix) + `.ps1` (Windows) | Generate both `.sh` and `.ps1` wrappers for every migrated hook |
 
 ## Cline hook paths
@@ -26,8 +26,9 @@ This reference covers hook migration only. Other resource types are handled by `
 - Always preserve the original JSON config as reference material.
 - Always set `CLAUDE_PLUGIN_ROOT` in the wrapper.
 - Always read Cline stdin JSON and pass normalized Claude-style JSON to the original script.
-- Preserve basic matcher behavior inside the wrapper; skip non-matching tool calls with `{"cancel": false}`.
-- Convert deny/block decisions, exit code `2`, and additional context into Cline JSON.
+- Preserve basic matcher behavior inside the wrapper; skip non-matching tool calls with a successful empty result.
+- Preserve user-visible text as handler stdout; the event entry script wraps aggregated text into final Cline JSON.
+- If handler stdout happens to look like JSON, treat it as text rather than parsing it.
 - Generated compatibility wrappers run on Node.js at Cline hook runtime.
 - If multiple Claude handlers map to the same Cline event, the event entry script (`shell` / `ps1`) calls each translated `.mjs` handler sequentially and preserves handler order.
 - Mark every hook wrapper with `auto: false` and a non-null risk.
