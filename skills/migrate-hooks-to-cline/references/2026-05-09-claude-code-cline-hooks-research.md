@@ -48,7 +48,7 @@ Claude Code 采用 **JSON 配置驱动** 的 hooks 体系：
 - **并行执行**：所有匹配的 hooks 并行运行，相同 handler 自动去重。
 - **决策合并**：多 hook 冲突时取最严格结果。`PreToolUse` 中 `deny` > `ask` > `allow`。
 - **异步模式**：handler 可在首行 stdout 输出 `{"async": true}`，让操作不等待 hook 完成。
-- **环境变量**：`$CLAUDE_CODE_REMOTE` 标记远程环境；`CLAUDE_PLUGIN_ROOT` 指向项目根目录。
+- **环境变量**：`$CLAUDE_CODE_REMOTE` 标记远程环境；`CLAUDE_PLUGIN_ROOT` 在 Claude Code 源运行时指向项目根目录，这一事实只应用于源码分析，不应直接延续为迁移后 handler 的运行时依赖。
 - **特殊环境注入**：`SessionStart`, `Setup`, `CwdChanged`, `FileChanged` 接收 `CLAUDE_ENV_FILE`，Bash hook 可写入 `export VAR=value` 供后续 Bash tool 使用。
 - **Exit code 语义**：
   - `0`：正常通过
@@ -137,7 +137,7 @@ Hook 接收的 JSON 字段按类型命名：
 | **Event 数量** | 约 24 个 | 8 个 | 大量事件无 Cline 等价物，只能标记 not-migrated |
 | **Handler 类型** | 5 种（command, http, mcp_tool, prompt, agent） | 仅 command（可执行脚本） | http/mcp_tool/prompt/agent 均不可迁移 |
 | **Matcher** | 支持正则匹配过滤 | 无 matcher 机制 | Cline 脚本需自行在内部实现过滤逻辑 |
-| **环境变量** | `CLAUDE_PLUGIN_ROOT`, `CLAUDE_CODE_REMOTE` | 无内置 `CLAUDE_PLUGIN_ROOT` | wrapper 必须手动设置 `CLAUDE_PLUGIN_ROOT` |
+| **环境变量** | `CLAUDE_PLUGIN_ROOT`, `CLAUDE_CODE_REMOTE` | 无内置 `CLAUDE_PLUGIN_ROOT` | 迁移时可将 `CLAUDE_PLUGIN_ROOT` 解析为 repo-local 路径证据，但迁移后的 handler 不应继续依赖该环境变量 |
 | **Stdin 契约** | command 类型不强制消费 stdin | 脚本必须消费 stdin，否则 runtime 挂起 | wrapper 必须读取 stdin |
 | **平台支持** | 宿主依赖（Unix bash / Windows cmd） | 原生跨平台（`.sh` + `.ps1`） | 每 hook 需生成两套 wrapper |
 | **异步执行** | 支持 `{"async": true}` | 未明确支持 | 无法直接保留异步语义 |
@@ -198,7 +198,7 @@ Hook 接收的 JSON 字段按类型命名：
 
 1. **范围限定正确**：仅处理 JSON 配置中的 hooks，不碰 skills/rules/agents/workflows。
 2. **决策树合理**：仅对 `command` 类型的本地脚本生成 wrapper，其余标记 `not-migrated`。
-3. **Wrapper 设计必要**：stdin 消费、`CLAUDE_PLUGIN_ROOT` 设置、跨平台 wrapper 都是真实存在的技术鸿沟。
+3. **Wrapper 设计必要**：stdin 消费、`CLAUDE_PLUGIN_ROOT` 的源码期路径解析、跨平台 wrapper 都是真实存在的技术鸿沟。
 
 ### 4.2 可优化方向
 
