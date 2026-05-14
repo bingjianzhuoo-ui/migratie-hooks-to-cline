@@ -141,6 +141,43 @@ async function runUnixScript(scriptPath, stdinInput) {
   }
 }
 
+async function runInlineNodeScript(scriptSource, stdinInput, cwd = process.cwd()) {
+  const captureDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-node-'));
+  const stdoutPath = path.join(captureDir, 'stdout.txt');
+  const stderrPath = path.join(captureDir, 'stderr.txt');
+
+  try {
+    await execFileAsync(
+      'bash',
+      [
+        '-lc',
+        `printf '%s' ${shellEscape(stdinInput)} | node -e ${shellEscape(scriptSource)} > ${shellEscape(stdoutPath)} 2> ${shellEscape(stderrPath)}`,
+      ],
+      { cwd },
+    );
+
+    return {
+      stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
+      stderr: await readFile(stderrPath, 'utf8').catch(() => ''),
+      exitCode: 0,
+    };
+  } catch (error) {
+    return {
+      stdout: await readFile(stdoutPath, 'utf8').catch(() => ''),
+      stderr: await readFile(stderrPath, 'utf8').catch(() => ''),
+      exitCode:
+        error != null
+        && typeof error === 'object'
+        && 'code' in error
+        && typeof error.code === 'number'
+          ? error.code
+          : 1,
+    };
+  } finally {
+    await rm(captureDir, { recursive: true, force: true });
+  }
+}
+
 async function smokeTestUnixEntry(eventName, entryScriptContent, repoRoot) {
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), 'verify-hooks-'));
   const entryPath = path.join(tmpDir, eventName);
@@ -185,6 +222,56 @@ async function smokeTestUnixEntry(eventName, entryScriptContent, repoRoot) {
     }
   } finally {
     await rm(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function extractWindowsNormalizerScript(entryScriptContent) {
+  const match = entryScriptContent.match(/\$normalizeHandlerOutput = @'\r?\n([\s\S]*?)\r?\n'@/);
+  if (!match) {
+    throw new Error('Windows entry script is missing the normalize handler block.');
+  }
+
+  return match[1];
+}
+
+async function verifyWindowsEntryScript(entryPath, repoRoot) {
+  const entryScriptContent = await readFile(entryPath, 'utf8');
+  const normalizeScript = extractWindowsNormalizerScript(entryScriptContent);
+  const safeNodeBridge =
+    'node -e \'eval(Buffer.from(process.argv[1], "base64").toString("utf8"))\' $normalizeHandlerOutputBase64';
+
+  if (!normalizeScript.includes('require("node:fs")')) {
+    throw new Error(
+      `Windows entry script lost the quoted node:fs require: ${path.relative(repoRoot, entryPath)}`,
+    );
+  }
+  if (!entryScriptContent.includes('$normalizeHandlerOutputBase64 = "')) {
+    throw new Error(
+      `Windows entry script is missing the base64 normalize payload: ${path.relative(repoRoot, entryPath)}`,
+    );
+  }
+  if (!entryScriptContent.includes(safeNodeBridge)) {
+    throw new Error(
+      `Windows entry script is missing the safe node bridge: ${path.relative(repoRoot, entryPath)}`,
+    );
+  }
+
+  const rawOutputResult = await runInlineNodeScript(normalizeScript, 'plain-text-output', path.dirname(entryPath));
+  if (rawOutputResult.exitCode !== 0 || rawOutputResult.stdout.trim() !== 'plain-text-output') {
+    throw new Error(
+      `Windows normalize block raw-text check failed for ${path.relative(repoRoot, entryPath)}: ${rawOutputResult.stderr || rawOutputResult.stdout}`,
+    );
+  }
+
+  const jsonOutputResult = await runInlineNodeScript(
+    normalizeScript,
+    JSON.stringify({ cancel: false, contextModification: 'plugin1-context' }),
+    path.dirname(entryPath),
+  );
+  if (jsonOutputResult.exitCode !== 0 || jsonOutputResult.stdout.trim() !== 'plugin1-context') {
+    throw new Error(
+      `Windows normalize block JSON check failed for ${path.relative(repoRoot, entryPath)}: ${jsonOutputResult.stderr || jsonOutputResult.stdout}`,
+    );
   }
 }
 
@@ -283,12 +370,23 @@ export async function verifyHooks({
     smokeTests.push(path.relative(resolvedRepoRoot, firstEntry));
   }
 
+  const windowsEntries = [];
+  for (const entry of hookEntries) {
+    if (!entry.isFile() || !entry.name.endsWith('.ps1')) {
+      continue;
+    }
+    const entryPath = path.join(hooksDir, entry.name);
+    await verifyWindowsEntryScript(entryPath, resolvedRepoRoot);
+    windowsEntries.push(path.relative(resolvedRepoRoot, entryPath));
+  }
+
   return {
     status: 'verified',
     repoRoot: resolvedRepoRoot,
     hooksDir,
     checkedFiles: mjsFiles.map((filePath) => path.relative(resolvedRepoRoot, filePath)),
     smokeTests,
+    windowsEntries,
   };
 }
 
