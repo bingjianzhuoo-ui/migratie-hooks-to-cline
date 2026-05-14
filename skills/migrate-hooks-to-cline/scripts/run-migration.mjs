@@ -9,6 +9,8 @@ import { scanHooks } from './scan-hooks.mjs';
 import { verifyHooks } from './verify-hooks.mjs';
 import {
   cleanupMigrationSource,
+  CLAUDE_TO_CLINE_DIRECTORY_MAP,
+  detectClaudeDirectoryReferences,
   generateEntryScriptsForHandlers,
   isDirectRun,
   logError,
@@ -132,6 +134,30 @@ export async function collectHookSources(repoRoot, scanResult) {
   return { hooks, sourceFiles };
 }
 
+function collectDirectoryReferencesFromSources(sourceFiles) {
+  const allReferences = [];
+  const seen = new Set();
+
+  for (const sourceFile of sourceFiles ?? []) {
+    const content = typeof sourceFile.content === 'string' ? sourceFile.content : '';
+    const references = detectClaudeDirectoryReferences(content);
+
+    for (const reference of references) {
+      const key = `${sourceFile.path}:${reference.claudePattern}:${reference.index}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+      allReferences.push({
+        sourceFile: sourceFile.path,
+        ...reference,
+      });
+    }
+  }
+
+  return allReferences;
+}
+
 export async function buildAgentContext({
   projectRoot,
   sourceRoot,
@@ -140,6 +166,7 @@ export async function buildAgentContext({
   scanResult,
 }) {
   const { hooks, sourceFiles } = await collectHookSources(sourceRoot, scanResult);
+  const directoryReferences = collectDirectoryReferencesFromSources(sourceFiles);
   const prepareCommandExample = buildRunMigrationCommand(projectRoot, [
     'prepare',
     '--repo',
@@ -163,6 +190,8 @@ export async function buildAgentContext({
     sourceType,
     hooks,
     sourceFiles,
+    directoryMapping: CLAUDE_TO_CLINE_DIRECTORY_MAP,
+    detectedDirectoryReferences: directoryReferences,
     directWriteGuidance: {
       targetDirectory: '.clinerules/hooks',
       agentOwnedOutputs: [
@@ -198,13 +227,28 @@ export async function buildAgentContext({
         'If the source logic checks multiple candidate directories, preserve the same precedence order or fail explicitly.',
         'Do not collapse multi-directory lookup behavior into a single hard-coded directory without direct source evidence.',
       ],
+      directoryTranslationRules: [
+        'When a source script references files in Claude Code plugin directories, the translated handler MUST map those paths to their Cline equivalents using the directoryMapping table.',
+        'Claude Code plugin layout: PLUGIN_ROOT/skills/ → Cline .cline/skills/',
+        'Claude Code plugin layout: PLUGIN_ROOT/agents/ → Cline .clinerules/agents/',
+        'Claude Code plugin layout: PLUGIN_ROOT/hooks/ → Cline .clinerules/hooks/',
+        'Claude Code plugin layout: PLUGIN_ROOT/commands/ → Cline .clinerules/workflows/',
+        'When a hook script uses $CLAUDE_PLUGIN_ROOT/skills/ or SCRIPT_DIR/../skills/, the translated handler must use workspaceRoot + .cline/skills/ instead.',
+        'When a hook script uses $CLAUDE_PLUGIN_ROOT/agents/ or SCRIPT_DIR/../agents/, the translated handler must use workspaceRoot + .clinerules/agents/ instead.',
+        'SCRIPT_DIR/../ in a hook script (hooks/scripts/) resolves to PLUGIN_ROOT. In Cline, the equivalent is the workspace root. Translate accordingly.',
+        'If a source script reads multiple candidate directories in precedence order, preserve that order but map each candidate to its Cline equivalent.',
+        'Do NOT hard-code Claude-specific paths (CLAUDE_PLUGIN_ROOT, SCRIPT_DIR, .claude-plugin/) in the translated handler. All path references must use the Cline directory layout.',
+        'If a source script constructs paths using CLAUDE_PLUGIN_ROOT plus a plugin subdirectory, resolve CLAUDE_PLUGIN_ROOT at migration time AND translate the subdirectory to the Cline equivalent.',
+        'If detectedDirectoryReferences is non-empty, every referenced Claude directory pattern in those source files must be accounted for in the translated handler.',
+        'If a path cannot be safely translated (e.g. the Cline target directory does not exist or the mapping is ambiguous), fail explicitly rather than silently using the wrong path.',
+      ],
       semanticPreservationRules: [
         'Build a per-hook migration worksheet from source evidence only before choosing wrapper versus rewrite.',
         'Capture trigger conditions, matcher behavior, consumed inputs, produced outputs, exit codes, and lookup precedence.',
         'Only translate behavior that is provable from source evidence.',
         'Preserve matcher gates, branch conditions, side-effect order, and lookup precedence.',
         'Preserve injected context text exactly when it comes from static or repo-local source content.',
-        'Preserve required environment assumptions such as CLAUDE_PLUGIN_ROOT when the source relies on plugin-root-relative paths.',
+        'If the source relies on CLAUDE_PLUGIN_ROOT, resolve it to concrete repo-local paths during analysis and do not require that environment variable at migrated-hook runtime. If equivalent repo-local path resolution cannot be preserved safely, fail explicitly.',
         'Do not widen trigger scope or invent fallback behavior that the source does not contain.',
         'If a wrapper is chosen, it must stay minimal and behavior-preserving.',
       ],
