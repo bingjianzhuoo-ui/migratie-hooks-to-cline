@@ -104,7 +104,7 @@ All generated artifacts live in `.clinerules/hooks/`:
 - Windows entry: `<cline-event>.ps1`
 - JS handler: `<cline-event>-<plugin-slug>.mjs`
 
-The entry script is responsible for reading Cline event input once, discovering all `<EventName>-*.mjs` handlers for that event, invoking them sequentially, collecting stdout, and emitting the final Cline JSON. There is no separate dispatcher layer.
+The entry script is responsible for reading Cline event input once, discovering all `<EventName>-*.mjs` handlers for that event, invoking them sequentially, collecting stdout as literal text, and emitting the final Cline JSON. There is no separate dispatcher layer.
 
 Ownership:
 - agent writes `<EventName>-<plugin-slug>.mjs`
@@ -198,7 +198,7 @@ Before writing a handler, the agent must build a per-hook migration worksheet fr
 Minimum worksheet fields:
 - trigger conditions and matcher behavior
 - consumed inputs: stdin fields, environment variables, cwd, argv, repo-local files
-- produced outputs and control signals: stdout JSON/text, stderr, exit codes, cancel/deny/pass-through behavior
+- produced outputs and control signals: stdout text, stderr, exit codes, cancel/deny/pass-through behavior
 - lookup precedence, fallback rules, and helper-call order
 - unresolved external dependencies
 
@@ -206,6 +206,7 @@ Hard rules:
 - Only translate behavior that is provable from source evidence.
 - Preserve matcher gates, branch conditions, side-effect order, and lookup precedence.
 - Preserve injected context text exactly when it comes from static or repo-local source content.
+- Treat handler stdout as arbitrary literal text; if it happens to look like JSON, do not rely on parsing it.
 - Preserve exit-code semantics and block/fail/pass-through behavior when the source uses them.
 - Do not widen trigger scope or invent fallback behavior that the source does not contain.
 - If a wrapper is chosen, it must be behavior-preserving and minimal.
@@ -215,7 +216,7 @@ Hard rules:
 Before a `.mjs` handler is written, the agent must be able to answer yes to all of the following:
 - every emitted Cline field is traceable to source behavior
 - every consumed Cline event field is justified by the original hook input contract
-- stdout will contain exactly one valid Cline JSON object
+- handler stdout will contain only the final user-visible text
 - logs and diagnostics are isolated to stderr
 - file reads, path lookups, helper invocations, and environment-variable dependencies are preserved or declared unresolved
 - any rewrite is limited to behavior proved by the source
