@@ -455,11 +455,46 @@ const HANDLER_OUTPUT_NORMALIZER_LINES = Object.freeze([
   '}',
 ]);
 
-const HANDLER_OUTPUT_NORMALIZER_SOURCE = HANDLER_OUTPUT_NORMALIZER_LINES.join('\n');
 const HANDLER_OUTPUT_NORMALIZER_INLINE = HANDLER_OUTPUT_NORMALIZER_LINES.join(' ');
-const HANDLER_OUTPUT_NORMALIZER_BASE64 = Buffer
-  .from(HANDLER_OUTPUT_NORMALIZER_SOURCE, 'utf8')
-  .toString('base64');
+
+const POWERSHELL_HANDLER_OUTPUT_NORMALIZER_LINES = Object.freeze([
+  'function Normalize-HandlerOutput {',
+  '  param([string]$RawOutput)',
+  '  if (-not $RawOutput) {',
+  '    return ""',
+  '  }',
+  '  $trimmedOutput = $RawOutput.Trim()',
+  '  if (-not $trimmedOutput) {',
+  '    return ""',
+  '  }',
+  '  $first = $trimmedOutput[0]',
+  '  $looksLikeJson = $first -eq "{" -or $first -eq "["',
+  '  if (-not $looksLikeJson) {',
+  '    return $trimmedOutput',
+  '  }',
+  '  try {',
+  '    $parsed = $trimmedOutput | ConvertFrom-Json',
+  '  } catch {',
+  '    throw "Invalid handler JSON: $($_.Exception.Message)"',
+  '  }',
+  '  if ($null -eq $parsed -or $parsed -is [System.Array] -or $parsed -isnot [pscustomobject]) {',
+  '    throw "Handler JSON must be an object."',
+  '  }',
+  '  $cancelProperty = $parsed.PSObject.Properties["cancel"]',
+  '  if ($null -ne $cancelProperty -and $cancelProperty.Value) {',
+  '    $messageProperty = $parsed.PSObject.Properties["errorMessage"]',
+  '    if ($null -ne $messageProperty -and $messageProperty.Value) {',
+  '      throw [string]$messageProperty.Value',
+  '    }',
+  '    throw "Handler requested cancellation."',
+  '  }',
+  '  $contextProperty = $parsed.PSObject.Properties["contextModification"]',
+  '  if ($null -ne $contextProperty -and $contextProperty.Value -is [string]) {',
+  '    return [string]$contextProperty.Value',
+  '  }',
+  '  return ""',
+  '}',
+]);
 
 /**
  * Generate a Unix shell entry script for the given event.
@@ -520,10 +555,8 @@ export function generateWindowsEntryScript(eventName) {
     '# Auto-generated Cline hook entry for ' + eventName,
     '# Aggregates ' + eventName + '-<plugin>.mjs handlers in this directory.',
     '',
-    '$normalizeHandlerOutput = @\'',
-    ...HANDLER_OUTPUT_NORMALIZER_LINES,
-    '\'@',
-    '$normalizeHandlerOutputBase64 = "' + HANDLER_OUTPUT_NORMALIZER_BASE64 + '"',
+    ...POWERSHELL_HANDLER_OUTPUT_NORMALIZER_LINES,
+    '',
     'if ([Console]::IsInputRedirected) {',
     '  $inputJson = [Console]::In.ReadToEnd()',
     '} else {',
@@ -547,9 +580,10 @@ export function generateWindowsEntryScript(eventName) {
     '  if (-not $rawOutput) {',
     '    continue',
     '  }',
-    '  $normalized = $rawOutput | & node -e \'eval(Buffer.from(process.argv[1], "base64").toString("utf8"))\' $normalizeHandlerOutputBase64',
-    '  if ($LASTEXITCODE -ne 0) {',
-    '    $errorMessage = "Handler failed: $($handler.Name): $normalized"',
+    '  try {',
+    '    $normalized = Normalize-HandlerOutput -RawOutput $rawOutput',
+    '  } catch {',
+    '    $errorMessage = "Handler failed: $($handler.Name): $($_.Exception.Message)"',
     '    node -e "console.log(JSON.stringify({cancel:true,errorMessage:process.argv[1]}))" "$errorMessage"',
     '    exit 1',
     '  }',
