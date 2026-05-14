@@ -13,7 +13,41 @@ Only migrate Claude Code JSON-configured hooks from:
 - `.claude/settings.local.json`
 
 Do not scan or migrate skills, commands, agents, rules, or workflows.
+Non-hook resources may be read only as source evidence when a hook depends on them.
 Never emit install or migration steps that copy `skills/`, `.agents/skills/`, or `.claude/skills/` into `.cline/skills/`.
+
+## Resource Location Map
+
+Use this location map to keep resource boundaries explicit during migration:
+
+```text
+Source-side evidence
+.
+├── hooks/
+│   └── hooks.json                       # hook config source; in scope
+├── .claude/
+│   ├── settings.json                    # hook config source; in scope
+│   ├── settings.local.json              # hook config source; in scope
+│   └── skills/                          # readable as hook evidence only; not a migration target here
+├── skills/                              # readable as hook evidence only; not a migration target here
+└── .agents/
+    └── skills/                          # readable as hook evidence only; not a migration target here
+
+Target-side Cline layout
+.
+├── .clinerules/
+│   ├── hooks/                           # only writable target for this skill
+│   ├── agents/                          # out of scope here
+│   └── workflows/                       # out of scope here
+└── .cline/
+    └── skills/
+        └── <skill-name>/                # out of scope here
+```
+
+Boundary rules:
+- Treat non-hook resources as source evidence only when a hook reads them.
+- Never translate a hook into `.cline/skills/`, `.clinerules/agents/`, `.clinerules/workflows/`, or another non-hook target.
+- Preserve only the hook's runtime behavior when reading non-hook resources; do not turn that into skill, agent, workflow, or rules migration.
 
 ## Architecture
 
@@ -22,6 +56,99 @@ Never emit install or migration steps that copy `skills/`, `.agents/skills/`, or
 - **Script**: prepares source, scans hooks, generates entry scripts, verifies output, cleans up.
 
 Do not use `setup-plan.mjs`, action schemas, or runbook generation as the main path.
+
+## Translation Contract
+
+Treat Cline output semantics as a hard contract, not a best-effort hint.
+
+If the source hook injects startup instructions, context text, skill text, or any other user-visible prompt content via any of these shapes:
+- top-level `message`
+- top-level `additionalContext`
+- top-level `additional_context`
+- nested `hookSpecificOutput.additionalContext`
+- plain stdout text intended for context injection
+
+then the translated Cline handler must emit that text through `contextModification`.
+
+Required Cline output rule:
+- final handler stdout must be valid single-object JSON for Cline
+- use `contextModification` for injected text
+- use `errorMessage` for explicit failures when needed
+- use `cancel: false` only for successful pass-through behavior
+
+Forbidden in final Cline handler output:
+- `message`
+- `priority`
+- `additionalContext`
+- `additional_context`
+- `hookSpecificOutput`
+
+Failure rule for context hooks:
+- If the source hook clearly injects context and the translated result would emit only `{"cancel":false}` or otherwise omit the injected text, treat that hook as unresolved and fail explicitly.
+
+Debugging rule:
+- Never print logs or explanations to stdout.
+- If debug output is needed, write it to stderr only.
+
+## Source Traversal Rules
+
+Do not stop at the top-level hook config or a single script file.
+
+For each hook, the agent must inspect:
+- the hook config entry
+- the primary referenced script
+- repo-local supporting scripts already surfaced in `agentContext.sourceFiles`
+- any additional repo-local files that the primary script reads to construct hook output
+
+If the hook builds context by reading files from multiple directories, inspect all repo-local directories referenced by that logic before translating.
+
+Examples:
+- a shell script that `cat`s one or more `SKILL.md` files
+- a Node script that reads prompt fragments from several folders
+- a wrapper script that dispatches into another repo-local helper
+
+Directory traversal rule:
+- When the source script checks multiple candidate directories in a precedence order, preserve that order in translation or explicitly fail if it cannot be preserved safely.
+- Never collapse multi-directory lookup logic into a single hard-coded directory unless the source evidence proves only one directory is possible.
+
+## Semantic Preservation Rules
+
+Before writing any handler, build a per-hook migration worksheet from source evidence only.
+
+The worksheet must cover:
+- trigger conditions and matcher behavior
+- consumed inputs: stdin fields, environment variables, cwd, argv, and repo-local files
+- produced outputs and control signals: stdout JSON/text, stderr, exit codes, cancel/deny/pass-through behavior
+- directory lookup precedence, fallback rules, and helper-call order
+- repo-local dependencies versus unresolved external dependencies
+
+Preservation rules:
+- Only translate behavior that is provable from source evidence.
+- Preserve branch conditions, side-effect order, and lookup precedence.
+- Preserve injected context text exactly when it comes from static or repo-local source content.
+- If injected text is assembled dynamically from repo-local files, preserve the same meaning, ordering, and file precedence without inventing extra guidance.
+- Preserve exit-code semantics and decision behavior when the source hook uses them to block, fail, or pass through.
+- Preserve required environment assumptions such as `CLAUDE_PLUGIN_ROOT` when the source logic relies on plugin-root-relative paths.
+- Do not strengthen matchers, relax matchers, or widen the hook trigger scope without direct source evidence.
+- Do not collapse conditional behavior into unconditional `{"cancel":false}` success.
+- If a wrapper is sufficient, keep it minimal and behavior-preserving; if it is not behavior-preserving, rewrite or fail.
+
+## Pre-Write Quality Gate
+
+Before writing `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`, the agent must be able to answer yes to all of the following:
+- Can every emitted Cline output field be traced back to specific source behavior?
+- Can every consumed Cline event field be justified by the original hook input contract?
+- Is stdout guaranteed to contain exactly one valid Cline JSON object and nothing else?
+- Are logs and diagnostics isolated to stderr?
+- Are file reads, path lookups, helper invocations, and environment-variable dependencies either preserved or explicitly marked unresolved?
+- If choosing rewrite over wrapper, is the rewrite limited to behavior proved by the source rather than a speculative reimplementation?
+
+Mandatory failure conditions:
+- Source behavior depends on shell pipelines, dynamic eval, or command chaining that cannot be modeled safely.
+- Hook correctness depends on external binaries, network services, or filesystem locations that are not repo-local and not safely reproducible.
+- The translation cannot explain how source exit codes or decision branches map to final Cline output.
+- Required injected text, matcher gates, or blocking behavior cannot be traced to source evidence.
+- The translation would need to invent prompt text, default values, or fallback behavior not present in the source.
 
 ## Entry Decision
 
@@ -46,7 +173,7 @@ Success criteria:
 1. `.clinerules/hooks/` contains the expected files.
 2. All `.mjs` files pass `node --check`.
 3. Entry scripts can sequentially invoke handlers and emit valid Cline JSON.
-4. Any unresolved hook fails explicitly — never silently skipped.
+4. Unresolved hooks fail explicitly.
 
 ## Script Inventory
 
@@ -125,10 +252,14 @@ Never copy `run-migration.mjs` into another directory and run it detached from i
      - Return `awaiting-agent-migration`
 
 3. **Study** — Read `agentContext`: hook facts, original scripts, supporting scripts.
+   - If a source script reads additional repo-local files to produce output, open those files too before deciding on migration.
+   - For context-injection hooks, identify exactly where the source text comes from and what output field carries it.
+   - Build the per-hook migration worksheet before choosing wrapper versus rewrite.
 4. **Classify each hook**:
    - Safe JS rewrite
    - Wrapper is sufficient
    - Not safely migratable
+   - Run the pre-write quality gate; if any item fails, mark the hook unresolved instead of guessing.
 5. **Write handlers** — Only write:
    - `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`
 6. **Finalize** — Hand results back to the script layer:
@@ -155,11 +286,7 @@ Never skip `finalizeMigration()` and manually invoke `verify-hooks.mjs`.
 ## Agent Write Boundary
 
 - **Allowed**: `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`
-- **Forbidden**:
-  - `.clinerules/hooks/<EventName>`
-  - `.clinerules/hooks/<EventName>.ps1`
-  - `.tmp` cleanup
-  - Treating unresolved hooks as successful
+- **Forbidden**: entry scripts, `.tmp` cleanup, and treating unresolved hooks as successful
 
 ## Script Responsibilities
 
@@ -183,10 +310,9 @@ Script handles only deterministic work:
 ## Done Condition
 
 Skill is complete only when all of the following are true:
-- Agent has written all handler `.mjs` files.
-- Script has generated `<EventName>` and `<EventName>.ps1` entry scripts.
-- Verification has passed.
-- Cleanup has occurred **after** verification passed.
+- Agent has written the handler `.mjs` files.
+- Script-generated entry files exist, verification has passed, and cleanup happened only after verification.
+- Any source context injection has been preserved through `contextModification`.
 
 ## Event Mapping
 
