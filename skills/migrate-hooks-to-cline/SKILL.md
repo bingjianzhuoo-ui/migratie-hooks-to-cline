@@ -59,7 +59,7 @@ Do not use `setup-plan.mjs`, action schemas, or runbook generation as the main p
 
 ## Translation Contract
 
-Treat Cline output semantics as a hard contract, not a best-effort hint.
+Treat the migrated handler contract as a hard contract, not a best-effort hint.
 
 If the source hook injects startup instructions, context text, skill text, or any other user-visible prompt content via any of these shapes:
 - top-level `message`
@@ -68,23 +68,20 @@ If the source hook injects startup instructions, context text, skill text, or an
 - nested `hookSpecificOutput.additionalContext`
 - plain stdout text intended for context injection
 
-then the translated Cline handler must emit that text through `contextModification`.
+then the translated handler must write that final text to `stdout`.
 
-Required Cline output rule:
-- final handler stdout must be valid single-object JSON for Cline
-- use `contextModification` for injected text
-- use `errorMessage` for explicit failures when needed
-- use `cancel: false` only for successful pass-through behavior
+Required handler output rule:
+- handler `stdout` may be any user-visible text
+- handler `stderr` is diagnostics only
+- handler failure is expressed through non-zero exit code plus `stderr`
+- Unix/Windows entry scripts treat collected `stdout` as literal text and convert it into final Cline `contextModification`
+- if handler `stdout` happens to look like JSON, it is still treated as text rather than parsed
 
-Forbidden in final Cline handler output:
-- `message`
-- `priority`
-- `additionalContext`
-- `additional_context`
-- `hookSpecificOutput`
+Implication:
+- define handler behavior in terms of the final text it prints, not in terms of handler-level JSON fields
 
 Failure rule for context hooks:
-- If the source hook clearly injects context and the translated result would emit only `{"cancel":false}` or otherwise omit the injected text, treat that hook as unresolved and fail explicitly.
+- If the source hook clearly injects context and the translated handler would emit empty `stdout` or otherwise omit the injected text, treat that hook as unresolved and fail explicitly.
 
 Debugging rule:
 - Never print logs or explanations to stdout.
@@ -118,7 +115,7 @@ Before writing any handler, build a per-hook migration worksheet from source evi
 The worksheet must cover:
 - trigger conditions and matcher behavior
 - consumed inputs: stdin fields, environment variables, cwd, argv, and repo-local files
-- produced outputs and control signals: stdout JSON/text, stderr, exit codes, cancel/deny/pass-through behavior
+- produced outputs and control signals: stdout text, stderr, exit codes, cancel/deny/pass-through behavior
 - directory lookup precedence, fallback rules, and helper-call order
 - repo-local dependencies versus unresolved external dependencies
 
@@ -130,7 +127,7 @@ Preservation rules:
 - Preserve exit-code semantics and decision behavior when the source hook uses them to block, fail, or pass through.
 - Preserve required environment assumptions such as `CLAUDE_PLUGIN_ROOT` when the source logic relies on plugin-root-relative paths.
 - Do not strengthen matchers, relax matchers, or widen the hook trigger scope without direct source evidence.
-- Do not collapse conditional behavior into unconditional `{"cancel":false}` success.
+- Do not collapse conditional behavior into unconditional successful pass-through.
 - If a wrapper is sufficient, keep it minimal and behavior-preserving; if it is not behavior-preserving, rewrite or fail.
 
 ## Pre-Write Quality Gate
@@ -138,7 +135,7 @@ Preservation rules:
 Before writing `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`, the agent must be able to answer yes to all of the following:
 - Can every emitted Cline output field be traced back to specific source behavior?
 - Can every consumed Cline event field be justified by the original hook input contract?
-- Is stdout guaranteed to contain exactly one valid Cline JSON object and nothing else?
+- Is handler `stdout` guaranteed to contain only the final user-visible text that should be injected?
 - Are logs and diagnostics isolated to stderr?
 - Are file reads, path lookups, helper invocations, and environment-variable dependencies either preserved or explicitly marked unresolved?
 - If choosing rewrite over wrapper, is the rewrite limited to behavior proved by the source rather than a speculative reimplementation?
@@ -251,18 +248,30 @@ Never copy `run-migration.mjs` into another directory and run it detached from i
      - Build `agentContext`
      - Return `awaiting-agent-migration`
 
-3. **Study** — Read `agentContext`: hook facts, original scripts, supporting scripts.
+3. **Load references first** — Before classifying any hook or writing any handler, the agent must open and read:
+   - `references/cline-migration-rules.md`
+   - `references/difference.md`
+
+   If migration semantics, event mapping, or wrapper-vs-rewrite tradeoffs are still unclear, also open:
+   - `references/2026-05-09-claude-code-cline-hooks-research.md`
+
+   Reference-loading rules:
+   - Do not treat a filename mention in this `SKILL.md` as sufficient; actually open the reference file.
+   - Do not skip the two required references even if the current hook looks simple.
+   - Do not start classification or code writing until the required references have been read.
+
+4. **Study** — Read `agentContext`: hook facts, original scripts, supporting scripts.
    - If a source script reads additional repo-local files to produce output, open those files too before deciding on migration.
-   - For context-injection hooks, identify exactly where the source text comes from and what output field carries it.
+   - For context-injection hooks, identify exactly where the source text comes from and rewrite the handler so that exact final text becomes plain `stdout`.
    - Build the per-hook migration worksheet before choosing wrapper versus rewrite.
-4. **Classify each hook**:
+5. **Classify each hook**:
    - Safe JS rewrite
    - Wrapper is sufficient
    - Not safely migratable
    - Run the pre-write quality gate; if any item fails, mark the hook unresolved instead of guessing.
-5. **Write handlers** — Only write:
+6. **Write handlers** — Only write:
    - `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`
-6. **Finalize** — Hand results back to the script layer:
+7. **Finalize** — Hand results back to the script layer:
 
    ```bash
    node <current-skill-dir>/scripts/run-migration.mjs finalize --project-root . --cleanup-path .tmp/<repo-name>
@@ -279,7 +288,7 @@ Never copy `run-migration.mjs` into another directory and run it detached from i
      - Call `verifyHooks()`
      - Call `cleanupMigrationSource()` **only after verify passes**
 
-7. **Completion** — Skill is only done after script finalize finishes.
+8. **Completion** — Skill is only done after script finalize finishes.
 
 Never skip `finalizeMigration()` and manually invoke `verify-hooks.mjs`.
 
@@ -312,7 +321,7 @@ Script handles only deterministic work:
 Skill is complete only when all of the following are true:
 - Agent has written the handler `.mjs` files.
 - Script-generated entry files exist, verification has passed, and cleanup happened only after verification.
-- Any source context injection has been preserved through `contextModification`.
+- Any source context injection has been preserved through handler `stdout` and final entry-script `contextModification`.
 
 ## Event Mapping
 
