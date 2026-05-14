@@ -186,11 +186,11 @@ export async function buildAgentContext({
       failureRule:
         'If any hook cannot be safely migrated, fail explicitly instead of writing placeholder files.',
       translationContract: [
-        'Treat Cline hook stdout as a strict JSON contract, not a free-form response.',
-        'If the source hook injects text through message, additionalContext, additional_context, hookSpecificOutput.additionalContext, or plain stdout, translate that text into contextModification.',
-        'Do not preserve message, priority, additionalContext, additional_context, or hookSpecificOutput in final Cline handler output.',
-        'If the source hook injects context and the translated handler would emit only {"cancel":false} or otherwise omit contextModification, treat that as a migration failure.',
-        'Write debug logs to stderr only. Stdout must remain valid Cline JSON.',
+        'Treat migrated handler stdout as arbitrary user-visible text.',
+        'Any handler stdout is treated as literal text and passed through even if it looks like JSON.',
+        'If the source hook injects text through message, additionalContext, additional_context, hookSpecificOutput.additionalContext, or plain stdout, rewrite the handler so stdout contains that final injected text.',
+        'Write debug logs to stderr only. Handler stdout must contain only the final user-visible text.',
+        'Use non-zero exit codes plus stderr for failures instead of cancel/errorMessage JSON from handlers.',
       ],
       sourceTraversalRules: [
         'Read the hook config entry, primary script, and every repo-local supporting file already surfaced in sourceFiles before deciding on migration.',
@@ -211,7 +211,7 @@ export async function buildAgentContext({
       preWriteQualityGate: [
         'Every emitted Cline output field must be traceable to specific source behavior.',
         'Every consumed Cline event field must be justified by the original hook input contract.',
-        'Stdout must contain exactly one valid Cline JSON object and nothing else.',
+        'Handler stdout must contain only the final user-visible text that should be injected.',
         'Logs and diagnostics must go to stderr only.',
         'File reads, path lookups, helper invocations, and environment-variable dependencies must be preserved or marked unresolved.',
         'Any rewrite must be limited to behavior proved by the source rather than a speculative reimplementation.',
