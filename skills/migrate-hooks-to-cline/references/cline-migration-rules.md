@@ -18,11 +18,21 @@ This skill does not process:
 - workflows
 - native Cline hooks already living under `hooks/cline/`
 
+## Resource Location Map
+
+Use the `Resource Location Map` in `SKILL.md` as the canonical tree.
+
+Boundary rules:
+- Non-hook resources may be read as source evidence only when a hook depends on them.
+- Hooks must never be translated into `.cline/skills/`, `.clinerules/agents/`, `.clinerules/workflows/`, or other non-hook targets.
+- Do not reinterpret hook translation as a skill, workflow, agent, or rules migration task.
+
 Compatibility rule:
 - Callers should not need to pass the full orchestration prompt for compatibility behavior.
 - If the current project already contains Claude hook configs and hook content, the skill should scan the local project directly.
 - If the local project has no Claude hook content, the skill must require `run-migration.mjs --repo <source>`.
 - If the user prompt explicitly names a repo source such as `obra/superpowers`, the skill should pass it through as `--repo <source>`.
+- Any command invoking `run-migration.mjs` must use the script path under the current skill directory; do not assume the working directory is the skill root.
 
 ## Core Boundary
 
@@ -64,6 +74,7 @@ Scripts own only deterministic work.
 - auto-approve risky event mappings
 - silently downgrade unresolved hooks to success
 - generate the final result around `setup-plan.mjs`, runbooks, or action schemas
+- write outputs outside `.clinerules/hooks/` for this skill
 
 ## Minimal Script Set
 
@@ -179,6 +190,42 @@ The decision must be based on reading:
 - supporting local scripts when the primary script dispatches elsewhere
 
 Do not stop at runtime classification when the repo still contains enough information to understand the hook behavior.
+
+## Semantic Preservation Gate
+
+Before writing a handler, the agent must build a per-hook migration worksheet from source evidence only.
+
+Minimum worksheet fields:
+- trigger conditions and matcher behavior
+- consumed inputs: stdin fields, environment variables, cwd, argv, repo-local files
+- produced outputs and control signals: stdout JSON/text, stderr, exit codes, cancel/deny/pass-through behavior
+- lookup precedence, fallback rules, and helper-call order
+- unresolved external dependencies
+
+Hard rules:
+- Only translate behavior that is provable from source evidence.
+- Preserve matcher gates, branch conditions, side-effect order, and lookup precedence.
+- Preserve injected context text exactly when it comes from static or repo-local source content.
+- Preserve exit-code semantics and block/fail/pass-through behavior when the source uses them.
+- Do not widen trigger scope or invent fallback behavior that the source does not contain.
+- If a wrapper is chosen, it must be behavior-preserving and minimal.
+
+## Pre-Write Quality Gate
+
+Before a `.mjs` handler is written, the agent must be able to answer yes to all of the following:
+- every emitted Cline field is traceable to source behavior
+- every consumed Cline event field is justified by the original hook input contract
+- stdout will contain exactly one valid Cline JSON object
+- logs and diagnostics are isolated to stderr
+- file reads, path lookups, helper invocations, and environment-variable dependencies are preserved or declared unresolved
+- any rewrite is limited to behavior proved by the source
+
+Fail the migration instead of guessing when:
+- shell pipelines, command chaining, or dynamic eval are required for correctness
+- correctness depends on external binaries, network services, or non-repo-local filesystem state
+- exit-code mapping or decision branches cannot be explained
+- required injected text or matcher/blocking behavior cannot be traced to source evidence
+- translation would need invented prompt text, defaults, or fallback behavior
 
 ## Verification Rules
 
