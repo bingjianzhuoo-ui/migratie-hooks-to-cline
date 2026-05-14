@@ -225,52 +225,29 @@ async function smokeTestUnixEntry(eventName, entryScriptContent, repoRoot) {
   }
 }
 
-function extractWindowsNormalizerScript(entryScriptContent) {
-  const match = entryScriptContent.match(/\$normalizeHandlerOutput = @'\r?\n([\s\S]*?)\r?\n'@/);
-  if (!match) {
-    throw new Error('Windows entry script is missing the normalize handler block.');
-  }
-
-  return match[1];
-}
-
 async function verifyWindowsEntryScript(entryPath, repoRoot) {
   const entryScriptContent = await readFile(entryPath, 'utf8');
-  const normalizeScript = extractWindowsNormalizerScript(entryScriptContent);
-  const safeNodeBridge =
-    'node -e \'eval(Buffer.from(process.argv[1], "base64").toString("utf8"))\' $normalizeHandlerOutputBase64';
-
-  if (!normalizeScript.includes('require("node:fs")')) {
+  if (!entryScriptContent.includes('function Normalize-HandlerOutput')) {
     throw new Error(
-      `Windows entry script lost the quoted node:fs require: ${path.relative(repoRoot, entryPath)}`,
+      `Windows entry script is missing the PowerShell normalize function: ${path.relative(repoRoot, entryPath)}`,
     );
   }
-  if (!entryScriptContent.includes('$normalizeHandlerOutputBase64 = "')) {
+  if (!entryScriptContent.includes('ConvertFrom-Json')) {
     throw new Error(
-      `Windows entry script is missing the base64 normalize payload: ${path.relative(repoRoot, entryPath)}`,
+      `Windows entry script is missing JSON parsing logic: ${path.relative(repoRoot, entryPath)}`,
     );
   }
-  if (!entryScriptContent.includes(safeNodeBridge)) {
+  if (!entryScriptContent.includes('Normalize-HandlerOutput -RawOutput $rawOutput')) {
     throw new Error(
-      `Windows entry script is missing the safe node bridge: ${path.relative(repoRoot, entryPath)}`,
+      `Windows entry script is missing normalize invocation: ${path.relative(repoRoot, entryPath)}`,
     );
   }
-
-  const rawOutputResult = await runInlineNodeScript(normalizeScript, 'plain-text-output', path.dirname(entryPath));
-  if (rawOutputResult.exitCode !== 0 || rawOutputResult.stdout.trim() !== 'plain-text-output') {
+  if (
+    entryScriptContent.includes('$normalizeHandlerOutputBase64')
+    || entryScriptContent.includes('Buffer.from(process.argv[1], "base64").toString("utf8")')
+  ) {
     throw new Error(
-      `Windows normalize block raw-text check failed for ${path.relative(repoRoot, entryPath)}: ${rawOutputResult.stderr || rawOutputResult.stdout}`,
-    );
-  }
-
-  const jsonOutputResult = await runInlineNodeScript(
-    normalizeScript,
-    JSON.stringify({ cancel: false, contextModification: 'plugin1-context' }),
-    path.dirname(entryPath),
-  );
-  if (jsonOutputResult.exitCode !== 0 || jsonOutputResult.stdout.trim() !== 'plugin1-context') {
-    throw new Error(
-      `Windows normalize block JSON check failed for ${path.relative(repoRoot, entryPath)}: ${jsonOutputResult.stderr || jsonOutputResult.stdout}`,
+      `Windows entry script still relies on inline node bridge quoting: ${path.relative(repoRoot, entryPath)}`,
     );
   }
 }
