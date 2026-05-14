@@ -314,6 +314,197 @@ export async function readJsonFile(filePath) {
   return JSON.parse(raw);
 }
 
+// ---------------------------------------------------------------------------
+// Claude → Cline directory mapping
+// ---------------------------------------------------------------------------
+
+export const CLAUDE_TO_CLINE_DIRECTORY_MAP = Object.freeze([
+  {
+    claudePattern: 'PLUGIN_ROOT/skills/',
+    clineTarget: '.cline/skills/',
+    description: 'Plugin skills directory (PLUGIN_ROOT/skills/) maps to Cline skills directory',
+    matchInScript: 'skills/',
+  },
+  {
+    claudePattern: 'PLUGIN_ROOT/agents/',
+    clineTarget: '.clinerules/agents/',
+    description: 'Plugin agents directory (PLUGIN_ROOT/agents/) maps to Cline agents directory',
+    matchInScript: 'agents/',
+  },
+  {
+    claudePattern: 'PLUGIN_ROOT/hooks/',
+    clineTarget: '.clinerules/hooks/',
+    description: 'Plugin hooks directory (PLUGIN_ROOT/hooks/) maps to Cline hooks directory',
+    matchInScript: 'hooks/',
+  },
+  {
+    claudePattern: 'PLUGIN_ROOT/commands/',
+    clineTarget: '.clinerules/workflows/',
+    description: 'Plugin commands directory (PLUGIN_ROOT/commands/) maps to Cline workflows directory',
+    matchInScript: 'commands/',
+  },
+  {
+    claudePattern: 'HOOKS_SCRIPTS_DIR/../',
+    clineTarget: '<workspace-root>/',
+    description: 'SCRIPT_DIR/../ from hooks/scripts/ resolves to PLUGIN_ROOT; translates to workspace root',
+    matchInScript: null,
+  },
+]);
+
+const CLAUDE_PLUGIN_ROOT_PATTERNS = Object.freeze([
+  /\$\{?CLAUDE_PLUGIN_ROOT\}?[/\\]+skills[/\\]/g,
+  /\$\{?CLAUDE_PLUGIN_ROOT\}?[/\\]+agents[/\\]/g,
+  /\$\{?CLAUDE_PLUGIN_ROOT\}?[/\\]+hooks[/\\]/g,
+  /\$\{?CLAUDE_PLUGIN_ROOT\}?[/\\]+commands[/\\]/g,
+]);
+
+const CLAUDE_SCRIPT_DIR_RELATIVE_PATTERNS = Object.freeze([
+  /\$\{?SCRIPT_DIR\}?[/\\]+\.\.[/\\]+/g,
+  /"\$\(dirname\s+"?\$\{?0\}?"?\)"[/\\]+\.\.[/\\]+/g,
+  /"\$\(dirname\s+"\$0"\)"[/\\]+\.\.[/\\]+/g,
+]);
+
+const CLAUDE_BARE_DIR_PATTERNS = Object.freeze([
+  {
+    regex: /(?:^|[/\\])skills[/\\]/g,
+    claudePattern: 'PLUGIN_ROOT/skills/',
+    clineTarget: '.cline/skills/',
+    description: 'Plugin skills directory (PLUGIN_ROOT/skills/) maps to Cline skills directory',
+  },
+  {
+    regex: /(?:^|[/\\])agents[/\\]/g,
+    claudePattern: 'PLUGIN_ROOT/agents/',
+    clineTarget: '.clinerules/agents/',
+    description: 'Plugin agents directory (PLUGIN_ROOT/agents/) maps to Cline agents directory',
+  },
+  {
+    regex: /(?:^|[/\\])hooks[/\\]/g,
+    claudePattern: 'PLUGIN_ROOT/hooks/',
+    clineTarget: '.clinerules/hooks/',
+    description: 'Plugin hooks directory (PLUGIN_ROOT/hooks/) maps to Cline hooks directory',
+  },
+  {
+    regex: /(?:^|[/\\])commands[/\\]/g,
+    claudePattern: 'PLUGIN_ROOT/commands/',
+    clineTarget: null,
+    description: 'Plugin commands directory (PLUGIN_ROOT/commands/) has no Cline equivalent; out of scope',
+  },
+]);
+
+function extractSubsequentDir(scriptContent, fromIndex, matchedLength) {
+  const restOfLine = scriptContent.slice(fromIndex + matchedLength, fromIndex + matchedLength + 40);
+  const subDir = restOfLine.match(/^["']*?(\w+)(?:[/\\]|["'\s;]|$)/)?.[1] ?? '';
+  return subDir;
+}
+
+export function detectClaudeDirectoryReferences(scriptContent) {
+  if (typeof scriptContent !== 'string' || !scriptContent) {
+    return [];
+  }
+
+  const seen = new Set();
+  const references = [];
+  const coveredRanges = [];
+
+  function isCovered(startIndex, length) {
+    return coveredRanges.some(
+      ({ start, end }) => startIndex >= start && startIndex < end,
+    );
+  }
+
+  for (const regex of CLAUDE_PLUGIN_ROOT_PATTERNS) {
+    const localRegex = new RegExp(regex.source, 'g');
+    const matches = scriptContent.matchAll(localRegex);
+    for (const match of matches) {
+      const key = `plugin-root:${match.index}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      seen.add(key);
+
+      const matched = match[0];
+      const subDir = matched.match(/CLAUDE_PLUGIN_ROOT\}?[/\\]+(\w+)[/\\]/)?.[1] ?? '';
+      const mapping = CLAUDE_TO_CLINE_DIRECTORY_MAP.find(
+        (entry) => entry.matchInScript === `${subDir}/`,
+      );
+
+      coveredRanges.push({ start: match.index, end: match.index + matched.length });
+
+      references.push({
+        claudePattern: mapping?.claudePattern ?? `PLUGIN_ROOT/${subDir}/`,
+        clineTarget: mapping?.clineTarget ?? null,
+        matchedText: matched,
+        index: match.index,
+        description: mapping?.description ?? `CLAUDE_PLUGIN_ROOT/${subDir}/ reference`,
+        referenceKind: 'plugin-root-variable',
+      });
+    }
+  }
+
+  for (const pattern of CLAUDE_SCRIPT_DIR_RELATIVE_PATTERNS) {
+    const localRegex = new RegExp(pattern.source, 'g');
+    const matches = scriptContent.matchAll(localRegex);
+    for (const match of matches) {
+      const key = `script-dir-relative:${match.index}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      if (isCovered(match.index, match[0].length)) {
+        continue;
+      }
+      seen.add(key);
+
+      const matched = match[0];
+      const subDir = extractSubsequentDir(scriptContent, match.index, matched.length);
+      const mapping = subDir
+        ? CLAUDE_TO_CLINE_DIRECTORY_MAP.find((entry) => entry.matchInScript === `${subDir}/`)
+        : null;
+
+      coveredRanges.push({ start: match.index, end: match.index + matched.length });
+
+      references.push({
+        claudePattern: 'HOOKS_SCRIPTS_DIR/../',
+        clineTarget: '<workspace-root>/',
+        matchedText: matched,
+        index: match.index,
+        description: subDir
+          ? `SCRIPT_DIR/../ resolves to PLUGIN_ROOT, then enters ${subDir}/ → maps to ${mapping?.clineTarget ?? 'no Cline equivalent'}`
+          : 'SCRIPT_DIR/../ resolves to PLUGIN_ROOT → maps to workspace root',
+        referenceKind: 'script-dir-relative',
+        subsequentDir: subDir || null,
+        subsequentDirMapping: mapping ?? null,
+      });
+    }
+  }
+
+  for (const pattern of CLAUDE_BARE_DIR_PATTERNS) {
+    const localRegex = new RegExp(pattern.regex.source, 'g');
+    const matches = scriptContent.matchAll(localRegex);
+    for (const match of matches) {
+      const key = `bare:${pattern.claudePattern}:${match.index}`;
+      if (seen.has(key)) {
+        continue;
+      }
+      if (isCovered(match.index, match[0].length)) {
+        continue;
+      }
+      seen.add(key);
+
+      references.push({
+        claudePattern: pattern.claudePattern,
+        clineTarget: pattern.clineTarget,
+        matchedText: match[0],
+        index: match.index,
+        description: pattern.description,
+        referenceKind: 'bare-directory',
+      });
+    }
+  }
+
+  references.sort((left, right) => left.index - right.index);
+  return references;
+}
+
 export function notImplemented(step) {
   const error = new Error(`${step} is not implemented yet.`);
   error.name = 'NotImplementedError';
