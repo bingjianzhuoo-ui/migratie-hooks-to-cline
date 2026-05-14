@@ -22,16 +22,38 @@ Use this location map to keep resource boundaries explicit during migration:
 
 ```text
 Source-side evidence
-.
-├── hooks/
-│   └── hooks.json                       # hook config source; in scope
-├── .claude/
-│   ├── settings.json                    # hook config source; in scope
-│   ├── settings.local.json              # hook config source; in scope
-│   └── skills/                          # readable as hook evidence only; not a migration target here
-├── skills/                              # readable as hook evidence only; not a migration target here
-└── .agents/
-    └── skills/                          # readable as hook evidence only; not a migration target here
+
+my-plugin/                          ← PLUGIN_ROOT（脚本中的变量指向这里）
+│
+├── .claude-plugin/
+│   └── plugin.json                 ← 唯一必须在这里的文件（manifest）
+│
+├── skills/                         ← 技能（按需自动激活）
+│   ├── using-skill/
+│   │   ├── SKILL.md                ← 技能定义
+│   │   ├── reference.md            ← 可选辅助文档
+│   │   └── scripts/                ← 可选辅助脚本
+│   │       └── helper.sh
+│   └── code-reviewer/
+│       └── SKILL.md
+│
+├── commands/                       ← 斜杠命令（旧方式，扁平 .md 文件）
+│   ├── review.md                   → /plugin-name:review
+│   └── deploy.md                   → /plugin-name:deploy
+│
+├── agents/                         ← 子代理角色
+│   ├── code-reviewer.md
+│   └── security-auditor.md
+│
+├── hooks/                          ← 事件钩子
+│   ├── hooks.json                  ← 钩子配置入口
+│   └── scripts/                    ← 钩子调用的脚本
+│       ├── pre-edit.sh             ← 脚本中 SCRIPT_DIR/../ 即 PLUGIN_ROOT
+│       └── validate.sh
+│
+├── .mcp.json                       ← MCP 外部服务集成
+├── .lsp.json                       ← LSP 语言服务器配置
+├── settings.json                   ← plugin 启用时的默认设置
 
 Target-side Cline layout
 .
@@ -108,6 +130,17 @@ Directory traversal rule:
 - When the source script checks multiple candidate directories in a precedence order, preserve that order in translation or explicitly fail if it cannot be preserved safely.
 - Never collapse multi-directory lookup logic into a single hard-coded directory unless the source evidence proves only one directory is possible.
 
+## Directory Path Translation Rules
+
+Claude Code plugins use a flat layout (`PLUGIN_ROOT/skills/`, `PLUGIN_ROOT/agents/`, etc.) while Cline uses a nested layout (`.cline/skills/`, `.clinerules/agents/`). Source scripts reference these via `$CLAUDE_PLUGIN_ROOT/<dir>/` or `SCRIPT_DIR/../<dir>/`.
+
+The `agentContext` returned by `prepare` provides:
+- `directoryMapping`: the full mapping table
+- `detectedDirectoryReferences`: every Claude directory reference found in source script content, with `referenceKind` distinguishing `plugin-root-variable`, `script-dir-relative`, and `bare-directory`
+- `directWriteGuidance.directoryTranslationRules`: concrete per-pattern translation instructions
+
+**Agent must**: translate every detected reference using the provided mapping; preserve lookup precedence; never hard-code `CLAUDE_PLUGIN_ROOT`, `SCRIPT_DIR/../`, or Claude directory paths in the handler; fail if any reference cannot be safely translated.
+
 ## Semantic Preservation Rules
 
 Before writing any handler, build a per-hook migration worksheet from source evidence only.
@@ -125,7 +158,7 @@ Preservation rules:
 - Preserve injected context text exactly when it comes from static or repo-local source content.
 - If injected text is assembled dynamically from repo-local files, preserve the same meaning, ordering, and file precedence without inventing extra guidance.
 - Preserve exit-code semantics and decision behavior when the source hook uses them to block, fail, or pass through.
-- Preserve required environment assumptions such as `CLAUDE_PLUGIN_ROOT` when the source logic relies on plugin-root-relative paths.
+- If the source logic references `CLAUDE_PLUGIN_ROOT`, treat it as source-side path evidence only: resolve it to concrete repo-local paths during analysis, and do not require `CLAUDE_PLUGIN_ROOT` at migrated-hook runtime. If equivalent repo-local path resolution cannot be preserved safely, fail explicitly.
 - Do not strengthen matchers, relax matchers, or widen the hook trigger scope without direct source evidence.
 - Do not collapse conditional behavior into unconditional successful pass-through.
 - If a wrapper is sufficient, keep it minimal and behavior-preserving; if it is not behavior-preserving, rewrite or fail.
@@ -139,6 +172,7 @@ Before writing `.clinerules/hooks/<EventName>-<plugin-slug>.mjs`, the agent must
 - Are logs and diagnostics isolated to stderr?
 - Are file reads, path lookups, helper invocations, and environment-variable dependencies either preserved or explicitly marked unresolved?
 - If choosing rewrite over wrapper, is the rewrite limited to behavior proved by the source rather than a speculative reimplementation?
+- Are all detected Claude directory references translated per `agentContext.directoryMapping`, with zero Claude-specific paths remaining?
 
 Mandatory failure conditions:
 - Source behavior depends on shell pipelines, dynamic eval, or command chaining that cannot be modeled safely.
@@ -146,6 +180,7 @@ Mandatory failure conditions:
 - The translation cannot explain how source exit codes or decision branches map to final Cline output.
 - Required injected text, matcher gates, or blocking behavior cannot be traced to source evidence.
 - The translation would need to invent prompt text, default values, or fallback behavior not present in the source.
+- A Claude-specific directory reference cannot be safely translated to a Cline equivalent.
 
 ## Entry Decision
 
