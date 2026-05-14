@@ -425,6 +425,42 @@ export const ENTRY_OUTPUT_CONTRACT = Object.freeze({
 // Entry-script generators
 // ---------------------------------------------------------------------------
 
+const HANDLER_OUTPUT_NORMALIZER_LINES = Object.freeze([
+  'const fs = require("node:fs");',
+  'const raw = fs.readFileSync(0, "utf8").trim();',
+  'if (!raw) process.exit(0);',
+  'const first = raw[0];',
+  'const looksLikeJson = first === "{" || first === "[";',
+  'if (!looksLikeJson) {',
+  '  process.stdout.write(raw);',
+  '  process.exit(0);',
+  '}',
+  'let parsed;',
+  'try {',
+  '  parsed = JSON.parse(raw);',
+  '} catch (error) {',
+  '  console.error(`Invalid handler JSON: ${error.message}`);',
+  '  process.exit(2);',
+  '}',
+  'if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {',
+  '  console.error("Handler JSON must be an object.");',
+  '  process.exit(2);',
+  '}',
+  'if (parsed.cancel) {',
+  '  console.error(parsed.errorMessage || "Handler requested cancellation.");',
+  '  process.exit(3);',
+  '}',
+  'if (typeof parsed.contextModification === "string") {',
+  '  process.stdout.write(parsed.contextModification);',
+  '}',
+]);
+
+const HANDLER_OUTPUT_NORMALIZER_SOURCE = HANDLER_OUTPUT_NORMALIZER_LINES.join('\n');
+const HANDLER_OUTPUT_NORMALIZER_INLINE = HANDLER_OUTPUT_NORMALIZER_LINES.join(' ');
+const HANDLER_OUTPUT_NORMALIZER_BASE64 = Buffer
+  .from(HANDLER_OUTPUT_NORMALIZER_SOURCE, 'utf8')
+  .toString('base64');
+
 /**
  * Generate a Unix shell entry script for the given event.
  * The script reads Cline event JSON from stdin, discovers all
@@ -455,7 +491,7 @@ export function generateUnixEntryScript(eventName) {
     '  if [ -z "$output" ]; then',
     '    continue',
     '  fi',
-    '  normalized=$(printf \'%s\' "$output" | node -e \'const fs=require("node:fs"); const raw=fs.readFileSync(0,"utf8").trim(); if (!raw) process.exit(0); const first=raw[0]; const looksLikeJson=first==="{" || first==="["; if (!looksLikeJson) { process.stdout.write(raw); process.exit(0); } let parsed; try { parsed=JSON.parse(raw); } catch (error) { console.error(`Invalid handler JSON: ${error.message}`); process.exit(2); } if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) { console.error("Handler JSON must be an object."); process.exit(2); } if (parsed.cancel) { console.error(parsed.errorMessage || "Handler requested cancellation."); process.exit(3); } if (typeof parsed.contextModification === "string") { process.stdout.write(parsed.contextModification); }\' 2>&1)',
+    '  normalized=$(printf \'%s\' "$output" | node -e \'' + HANDLER_OUTPUT_NORMALIZER_INLINE + '\' 2>&1)',
     '  parse_rc=$?',
     '  if [ $parse_rc -ne 0 ]; then',
     '    node -e \'console.log(JSON.stringify({cancel:true,errorMessage:process.argv[1]}))\' "Handler failed: $handler: $normalized"',
@@ -485,34 +521,9 @@ export function generateWindowsEntryScript(eventName) {
     '# Aggregates ' + eventName + '-<plugin>.mjs handlers in this directory.',
     '',
     '$normalizeHandlerOutput = @\'',
-    'const fs = require("node:fs");',
-    'const raw = fs.readFileSync(0, "utf8").trim();',
-    'if (!raw) process.exit(0);',
-    'const first = raw[0];',
-    'const looksLikeJson = first === "{" || first === "[";',
-    'if (!looksLikeJson) {',
-    '  process.stdout.write(raw);',
-    '  process.exit(0);',
-    '}',
-    'let parsed;',
-    'try {',
-    '  parsed = JSON.parse(raw);',
-    '} catch (error) {',
-    '  console.error(`Invalid handler JSON: ${error.message}`);',
-    '  process.exit(2);',
-    '}',
-    'if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {',
-    '  console.error("Handler JSON must be an object.");',
-    '  process.exit(2);',
-    '}',
-    'if (parsed.cancel) {',
-    '  console.error(parsed.errorMessage || "Handler requested cancellation.");',
-    '  process.exit(3);',
-    '}',
-    'if (typeof parsed.contextModification === "string") {',
-    '  process.stdout.write(parsed.contextModification);',
-    '}',
+    ...HANDLER_OUTPUT_NORMALIZER_LINES,
     '\'@',
+    '$normalizeHandlerOutputBase64 = "' + HANDLER_OUTPUT_NORMALIZER_BASE64 + '"',
     'if ([Console]::IsInputRedirected) {',
     '  $inputJson = [Console]::In.ReadToEnd()',
     '} else {',
@@ -536,7 +547,7 @@ export function generateWindowsEntryScript(eventName) {
     '  if (-not $rawOutput) {',
     '    continue',
     '  }',
-    '  $normalized = $rawOutput | & node -e $normalizeHandlerOutput',
+    '  $normalized = $rawOutput | & node -e \'eval(Buffer.from(process.argv[1], "base64").toString("utf8"))\' $normalizeHandlerOutputBase64',
     '  if ($LASTEXITCODE -ne 0) {',
     '    $errorMessage = "Handler failed: $($handler.Name): $normalized"',
     '    node -e "console.log(JSON.stringify({cancel:true,errorMessage:process.argv[1]}))" "$errorMessage"',
